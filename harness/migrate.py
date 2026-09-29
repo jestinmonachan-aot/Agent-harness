@@ -9,29 +9,29 @@ Two paths:
   (_migrate_direct), audit/smoke-test steps included, bounded by
   DEFAULT_NARROW_SCOPE_TIMEOUT. Fast, deployable on its own.
 
-- FULL APP: routes through the plan -> build-per-module -> assemble
-  pipeline (_run_full_app_module_pipeline) for real breadth across the
-  app's functional modules, rather than the single-call "pick one
-  central workflow" shortcut this file used previously. This trades a
-  strict 1-hour ceiling for a longer but much more complete run -
-  expect this to take considerably longer for a large app. Progress is
-  persisted to MIGRATION_STATE.json after every completed module, and
-  a usage/rate-limit failure raises UsageLimitError carrying the
-  output directory so a failed run can be resumed (pass the same
+- FULL APP: a PHASED migration (_run_full_app_module_pipeline):
+
+    1. PLAN (one call, --permission-mode plan, read-only): returns an
+       ordered list of phases, each with an id, a description and
+       done_criteria. Saved to MIGRATION_PLAN.json in the output dir.
+    2. EXECUTE (one call per phase, default bypassPermissions): each
+       phase's result is then VERIFIED before the next phase starts:
+         - the phase printed a PHASE_RESULT line with status COMPLETE
+         - EXISTING_UX_INVENTORY_<id>.md and PARITY_CHECK_<id>.md exist
+         - PARITY_CHECK_<id>.md has no MISSING items
+       If verification fails, ONE targeted fix-up call is made, then the
+       phase is verified again. If it still fails, the run stops with a
+       clear error instead of advancing on an incomplete phase.
+    3. ASSEMBLE: wire the phases into one app.
+
+  Progress is persisted to MIGRATION_STATE.json after every completed
+  phase, and a usage/rate-limit failure raises UsageLimitError carrying
+  the output directory so a failed run can be resumed (pass the same
   directory back in as resume_output_dir) rather than restarted.
 
-  Planning (_plan_modules) runs under --permission-mode plan: it should
-  only read/explore and return a JSON module list, never write files.
-  Every other call (module build, assembly, direct scope) stays on the
-  default bypassPermissions mode since those steps must write output.
-
 CODEBASE MAP: when analyze has already produced a codebase_map, it is
-passed through to EVERY Claude call in both paths - the direct call,
-planning, and every individual module - so none of them re-explore the
-repo's directory structure from scratch. This was previously only
-wired into the direct path; per-module calls were re-deriving the same
-structural context analyze had already produced, which is exactly the
-duplicated work this was meant to avoid.
+passed through to EVERY Claude call in both paths, so none of them
+re-explore the repo's directory structure from scratch.
 """
 
 from __future__ import annotations
@@ -45,17 +45,22 @@ from pathlib import Path
 from harness.claude_cli import run_claude_prompt
 from harness.prompts.migration_prompts import (
     build_direct_prompt,
-    build_planning_prompt,
-    build_module_prompt,
     build_assembly_prompt,
+)
+from harness.prompts.phase_prompts import (
+    build_phase_planning_prompt,
+    build_phase_prompt,
+    build_phase_fix_prompt,
 )
 
 DEFAULT_PLANNING_TIMEOUT = 600
 DEFAULT_PER_MODULE_TIMEOUT = 2700
 DEFAULT_ASSEMBLY_TIMEOUT = 1800
 DEFAULT_NARROW_SCOPE_TIMEOUT = 3000  # 50 min
+DEFAULT_FIX_TIMEOUT = 1500  # 25 min for the targeted fix-up call
 
 STATE_FILENAME = "MIGRATION_STATE.json"
+PLAN_FILENAME = "MIGRATION_PLAN.json"
 KNOWLEDGE_BASE_FILENAME = "KNOWLEDGE_BASE.md"
 
 USAGE_LIMIT_SIGNATURES = [
@@ -113,6 +118,19 @@ def _save_state(output_dir: Path, state: dict) -> None:
     state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
 
 
+def _snapshot(
+    scope, modules, completed_ids, chosen_stack, assembly_done, phases_state,
+) -> dict:
+    return {
+        "scope": scope,
+        "modules": modules,
+        "completed_module_ids": sorted(completed_ids),
+        "chosen_stack": chosen_stack,
+        "assembly_done": assembly_done,
+        "phases": phases_state,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Narrow-scope path: single direct call
 # ---------------------------------------------------------------------------
@@ -139,12 +157,19 @@ def _migrate_direct(
 
 
 # ---------------------------------------------------------------------------
-# Full-app path: plan -> build-per-module -> assemble
+# Full-app path: plan -> execute + verify each phase -> assemble
 # ---------------------------------------------------------------------------
 
+def _clean_phase_id(raw_id, index: int) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9_-]+", "_", str(raw_id)).strip("_")
+    return cleaned or f"phase_{index + 1}"
+
+
 def _plan_modules(input_repo_path: str, timeout: int, codebase_map: str = "") -> list[dict]:
-    print("[migrate] Planning module breakdown...", flush=True)
-    prompt = build_planning_prompt(input_repo_path, codebase_map=codebase_map)
+    """Call 1: read-only planning. Returns ordered phases, each
+    {"id", "description", "done_criteria"}."""
+    print("[migrate] Planning phases...", flush=True)
+    prompt = build_phase_planning_prompt(input_repo_path, codebase_map=codebase_map)
     result = run_claude_prompt(
         prompt, cwd=str(input_repo_path), timeout=timeout,
         extra_args=["--add-dir", str(input_repo_path)],
@@ -159,33 +184,37 @@ def _plan_modules(input_repo_path: str, timeout: int, codebase_map: str = "") ->
             )
         raise RuntimeError(f"Module planning failed. returncode={result.returncode}, stdout={result.stdout[:500]!r}")
 
-    match = re.search(r"\[.*\]", result.stdout, re.DOTALL)
+    match = re.search(r"\[\s*\{.*\}\s*\]", result.stdout, re.DOTALL)
     if match:
         try:
-            modules = json.loads(match.group(0))
-            if isinstance(modules, list) and modules:
-                return modules
+            raw = json.loads(match.group(0))
         except json.JSONDecodeError:
-            pass
-    return [{"id": "full_app", "description": "Entire application"}]
+            raw = None
+        if isinstance(raw, list):
+            phases: list[dict] = []
+            seen: set[str] = set()
+            for i, item in enumerate(raw):
+                if not isinstance(item, dict) or not item.get("id"):
+                    continue
+                phase_id = _clean_phase_id(item["id"], i)
+                if phase_id in seen:
+                    phase_id = f"{phase_id}_{i + 1}"
+                seen.add(phase_id)
+                criteria = item.get("done_criteria")
+                phases.append({
+                    "id": phase_id,
+                    "description": str(item.get("description") or phase_id),
+                    "done_criteria": [str(c) for c in criteria] if isinstance(criteria, list) else [],
+                })
+            if phases:
+                return phases
+    return [{"id": "full_app", "description": "Entire application", "done_criteria": []}]
 
 
-def _migrate_module(
-    input_repo_path: str,
-    output_dir: Path,
-    module: dict,
-    findings_md: str,
-    is_first_module: bool,
-    timeout: int,
-    codebase_map: str = "",
-) -> str:
-    module_id = module["id"]
-    print(f"[migrate] Building module: {module_id} ({module.get('description', module_id)})", flush=True)
-
-    prompt = build_module_prompt(
-        input_repo_path, output_dir, module, findings_md, is_first_module,
-        codebase_map=codebase_map,
-    )
+def _call_build(
+    prompt: str, output_dir: Path, input_repo_path: str, timeout: int, what: str,
+):
+    """One writing Claude call with uniform usage-limit / failure handling."""
     result = run_claude_prompt(
         prompt, cwd=str(output_dir), timeout=timeout,
         extra_args=["--add-dir", str(input_repo_path)],
@@ -193,38 +222,136 @@ def _migrate_module(
     if not result.success:
         if _looks_like_usage_limit(result.stdout, result.stderr):
             raise UsageLimitError(
-                f"Hit what looks like a usage/rate limit while migrating "
-                f"module '{module_id}': {result.stderr[:300] or result.stdout[:300]}. "
-                f"Modules completed before this one are safely saved in "
+                f"Hit what looks like a usage/rate limit while {what}: "
+                f"{result.stderr[:300] or result.stdout[:300]}. "
+                f"Phases completed before this one are safely saved in "
                 f"{output_dir} - resume to continue from here.",
                 output_dir,
             )
         raise RuntimeError(
-            f"Migration of module '{module_id}' failed. "
-            f"returncode={result.returncode}, stdout={result.stdout[:500]!r}"
+            f"{what} failed. returncode={result.returncode}, "
+            f"stdout={result.stdout[:500]!r}"
         )
+    return result
+
+
+def _parse_phase_result(stdout: str) -> dict | None:
+    """Returns the last PHASE_RESULT JSON object printed, or None."""
+    found = None
+    for match in re.finditer(r"PHASE_RESULT:\s*(\{.*\})", stdout):
+        try:
+            candidate = json.loads(match.group(1))
+        except json.JSONDecodeError:
+            continue
+        if isinstance(candidate, dict):
+            found = candidate
+    return found
+
+
+def _parity_missing_items(parity_file: Path) -> list[str]:
+    """Lines in a PARITY_CHECK file that still carry a MISSING status."""
+    missing = []
+    for line in parity_file.read_text(encoding="utf-8", errors="replace").splitlines():
+        if "DONE/MISSING" in line:  # legend/instruction line, not a status
+            continue
+        if re.search(r"\bMISSING\b", line):
+            missing.append(line.strip()[:200])
+    return missing
+
+
+def _verify_phase(output_dir: Path, phase: dict, stdout: str) -> list[str]:
+    """Returns a list of problems; an empty list means the phase is verified."""
+    phase_id = phase["id"]
+    problems: list[str] = []
+
+    inventory = output_dir / f"EXISTING_UX_INVENTORY_{phase_id}.md"
+    if not inventory.exists():
+        problems.append(f"{inventory.name} was not written.")
+
+    parity = output_dir / f"PARITY_CHECK_{phase_id}.md"
+    if not parity.exists():
+        problems.append(f"{parity.name} was not written.")
+    else:
+        for item in _parity_missing_items(parity):
+            problems.append(f"Parity check still lists a MISSING item: {item}")
+
+    result = _parse_phase_result(stdout)
+    if result is None:
+        problems.append("No PHASE_RESULT line was printed.")
+    elif str(result.get("status", "")).upper() != "COMPLETE":
+        missing = result.get("missing") or []
+        detail = "; ".join(str(m) for m in missing) if missing else "no details given"
+        problems.append(f"Phase reported INCOMPLETE: {detail}")
+
+    return problems
+
+
+def _run_phase(
+    input_repo_path: str, output_dir: Path, phase: dict, findings_md: str,
+    is_first_phase: bool, timeout: int, codebase_map: str,
+) -> tuple[str, int]:
+    """Call 2..N: execute one phase, verify its result, and make one
+    targeted fix-up attempt if verification fails. Returns
+    (stack_name, attempts)."""
+    phase_id = phase["id"]
+    print(f"[migrate] Building phase: {phase_id} ({phase.get('description', phase_id)})", flush=True)
+
+    prompt = build_phase_prompt(
+        input_repo_path, output_dir, phase, findings_md, is_first_phase,
+        codebase_map=codebase_map,
+    )
+    result = _call_build(
+        prompt, output_dir, input_repo_path, timeout,
+        f"migrating phase '{phase_id}'",
+    )
     stack_match = re.search(r"STACK_CHOSEN:\s*(.+)", result.stdout)
-    stack_result = stack_match.group(1).strip() if stack_match else "unknown"
-    print(f"[migrate] Module '{module_id}' done.", flush=True)
-    return stack_result
+    stack = stack_match.group(1).strip() if stack_match else "unknown"
+
+    problems = _verify_phase(output_dir, phase, result.stdout)
+    attempts = 1
+    if problems:
+        print(f"[migrate] Phase '{phase_id}' failed verification ({len(problems)} problem(s)); running one fix-up pass:", flush=True)
+        for p in problems:
+            print(f"[migrate]   - {p}", flush=True)
+        fix_prompt = build_phase_fix_prompt(output_dir, phase, problems)
+        fix_result = _call_build(
+            fix_prompt, output_dir, input_repo_path, DEFAULT_FIX_TIMEOUT,
+            f"fixing phase '{phase_id}'",
+        )
+        attempts = 2
+        fix_stack = re.search(r"STACK_CHOSEN:\s*(.+)", fix_result.stdout)
+        if fix_stack:
+            stack = fix_stack.group(1).strip()
+        problems = _verify_phase(output_dir, phase, fix_result.stdout)
+
+    if problems:
+        details = "\n".join(f"  - {p}" for p in problems)
+        raise RuntimeError(
+            f"Phase '{phase_id}' is still incomplete after a fix-up pass, so "
+            f"the migration stopped here instead of advancing. Output so far "
+            f"is preserved in {output_dir}.\nRemaining problems:\n{details}"
+        )
+
+    print(f"[migrate] Phase '{phase_id}' verified complete.", flush=True)
+    return stack, attempts
 
 
 def _assemble_modules(output_dir: Path, modules: list[dict], chosen_stack: str, timeout: int) -> None:
     if len(modules) <= 1:
         return
-    print(f"[migrate] Assembling {len(modules)} modules into final app...", flush=True)
+    print(f"[migrate] Assembling {len(modules)} phases into final app...", flush=True)
     prompt = build_assembly_prompt(output_dir, modules, chosen_stack)
     result = run_claude_prompt(prompt, cwd=str(output_dir), timeout=timeout)
     if not result.success:
         if _looks_like_usage_limit(result.stdout, result.stderr):
             raise UsageLimitError(
                 f"Hit what looks like a usage/rate limit during the final "
-                f"assembly pass. All modules are already migrated and saved in "
+                f"assembly pass. All phases are already migrated and saved in "
                 f"{output_dir} - resume to retry just the assembly step.",
                 output_dir,
             )
         raise RuntimeError(
-            f"Assembly pass failed (per-module output is still on disk at "
+            f"Assembly pass failed (per-phase output is still on disk at "
             f"{output_dir}, nothing was lost). returncode={result.returncode}, "
             f"stdout={result.stdout[:500]!r}"
         )
@@ -235,9 +362,8 @@ def _run_full_app_module_pipeline(
     planning_timeout: int, per_module_timeout: int, assembly_timeout: int,
     resume_output_dir: str | None, codebase_map: str = "",
 ) -> tuple[Path, str, list[dict]]:
-    """The full-breadth full-app path: plan -> build each module -> assemble.
-    Now the active path for full-app scope (see migrate_and_push) rather
-    than a kept-but-unused alternative."""
+    """Phased full-app migration: plan, then execute and verify each
+    phase in order, then assemble."""
     if resume_output_dir:
         output_dir = Path(resume_output_dir)
         state = _load_state(output_dir)
@@ -251,58 +377,40 @@ def _run_full_app_module_pipeline(
         completed_ids = set(state.get("completed_module_ids", []))
         chosen_stack = state.get("chosen_stack", "unknown")
         assembly_done = state.get("assembly_done", False)
+        phases_state = state.get("phases", {})
     else:
         output_dir = Path(tempfile.mkdtemp(prefix="migration_output_"))
         modules = _plan_modules(input_repo_path, planning_timeout, codebase_map=codebase_map)
         completed_ids = set()
         chosen_stack = "unknown"
         assembly_done = False
-        _save_state(output_dir, {
-            "scope": scope, "modules": modules,
-            "completed_module_ids": [], "chosen_stack": "unknown",
-            "assembly_done": False,
-        })
+        phases_state = {}
+        (output_dir / PLAN_FILENAME).write_text(json.dumps(modules, indent=2), encoding="utf-8")
+        _save_state(output_dir, _snapshot(scope, modules, completed_ids, chosen_stack, assembly_done, phases_state))
 
-    print(f"[migrate] Plan: {len(modules)} module(s) - {[m['id'] for m in modules]}", flush=True)
+    print(f"[migrate] Plan: {len(modules)} phase(s) - {[m['id'] for m in modules]}", flush=True)
     if completed_ids:
         print(f"[migrate] Already completed (will skip): {sorted(completed_ids)}", flush=True)
 
-    for i, module in enumerate(modules):
-        if module["id"] in completed_ids:
+    for i, phase in enumerate(modules):
+        if phase["id"] in completed_ids:
             continue
-        chosen_stack = _migrate_module(
-            input_repo_path, output_dir, module, findings_md,
-            is_first_module=(i == 0), timeout=per_module_timeout,
+        print(f"[migrate] === Phase {i + 1}/{len(modules)} ===", flush=True)
+        stack, attempts = _run_phase(
+            input_repo_path, output_dir, phase, findings_md,
+            is_first_phase=(i == 0), timeout=per_module_timeout,
             codebase_map=codebase_map,
         )
+        if stack != "unknown" or chosen_stack == "unknown":
+            chosen_stack = stack
 
-        # Require the module's own parity-check file as proof it actually
-        # finished its self-audit, not just that the CLI call returned
-        # successfully with STACK_CHOSEN text. Every module prompt (see
-        # migration_prompts.build_module_prompt, step 7) mandates writing
-        # this file, so its absence means the run didn't really complete.
-        parity_file = output_dir / f"PARITY_CHECK_{module['id']}.md"
-        if not parity_file.exists():
-            raise RuntimeError(
-                f"Module '{module['id']}' finished without writing "
-                f"{parity_file.name} - treating it as incomplete rather than "
-                f"advancing. Output so far is preserved in {output_dir}."
-            )
-
-        completed_ids.add(module["id"])
-        _save_state(output_dir, {
-            "scope": scope, "modules": modules,
-            "completed_module_ids": sorted(completed_ids),
-            "chosen_stack": chosen_stack, "assembly_done": False,
-        })
+        completed_ids.add(phase["id"])
+        phases_state[phase["id"]] = {"status": "complete", "attempts": attempts}
+        _save_state(output_dir, _snapshot(scope, modules, completed_ids, chosen_stack, False, phases_state))
 
     if not assembly_done:
         _assemble_modules(output_dir, modules, chosen_stack, assembly_timeout)
-        _save_state(output_dir, {
-            "scope": scope, "modules": modules,
-            "completed_module_ids": sorted(completed_ids),
-            "chosen_stack": chosen_stack, "assembly_done": True,
-        })
+        _save_state(output_dir, _snapshot(scope, modules, completed_ids, chosen_stack, True, phases_state))
 
     return output_dir, chosen_stack, modules
 
@@ -327,11 +435,11 @@ def migrate_and_push(
     Narrow scope -> single direct call (_migrate_direct), fast, not
     resumable (nothing partial to resume from one call).
 
-    Full app -> the module pipeline (_run_full_app_module_pipeline): plan,
-    build each module, assemble. RESUMABLE - if a module or assembly hits
-    a usage/rate limit, UsageLimitError carries output_dir; pass it back
-    as resume_output_dir to continue from the next incomplete step
-    without redoing finished modules or replanning.
+    Full app -> the phased pipeline (_run_full_app_module_pipeline): plan,
+    execute and verify each phase, assemble. RESUMABLE - if a phase or
+    assembly hits a usage/rate limit, UsageLimitError carries output_dir;
+    pass it back as resume_output_dir to continue from the next incomplete
+    step without redoing finished phases or replanning.
 
     `timeout`, if explicitly passed, overrides per_module_timeout, for
     backward compatibility with older callers.

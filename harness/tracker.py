@@ -13,7 +13,6 @@ STEP_TO_ACTION = {
     "plan": "Migration planning",
     "migrate": "Migration",
     "deploy": "Deployment",
-    "legacy_deploy": "Deployment",
 }
 
 def _to_dt(v):
@@ -38,10 +37,12 @@ def log_step(app_name, module, action, started_at, ended_at, account_type="Claud
 
 
 def log_finished_step(job_id, step_name, account_type="Claude Pro"):
+    if step_name not in STEP_TO_ACTION:
+        return
     try:
         from harness import db
         row = db.get_step(job_id, step_name)
-        job = db.get_job(job_id)  # may need renaming, see below
+        job = db.get_job(job_id)
         if not row or not job:
             return
         app_name = job["repo_url"].rstrip("/").split("/")[-1].removesuffix(".git")
@@ -51,7 +52,7 @@ def log_finished_step(job_id, step_name, account_type="Claude Pro"):
         if params_path.exists():
             module = json.loads(params_path.read_text(encoding="utf-8")).get("scope") or "All"
 
-        log_step(app_name, module, STEP_TO_ACTION.get(step_name, step_name),
+        log_step(app_name, module, STEP_TO_ACTION[step_name],
                  row["started_at"], row["updated_at"], account_type)
     except Exception as ex:
         print(f"tracker: {ex}")

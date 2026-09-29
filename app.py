@@ -136,6 +136,10 @@ with st.sidebar:
         st.success("Ready")
     else:
         st.error("Not available — check setup.")
+    try:
+        st.page_link("pages/1_Legacy_Deploy.py", label="Deploy the legacy app as-is")
+    except Exception:
+        pass   
 
 st.subheader("Select analysis focus areas")
 st.caption("Select the skills that you want in this application.")
@@ -374,33 +378,7 @@ if job_id is not None:
                     st.session_state.pop("resume_migration_btn", None)
                     st.rerun()
 
-        st.divider()
-
-        legacy_status = job_runner.get_step_status(job_id, "legacy_deploy")
-        legacy_running = bool(legacy_status and legacy_status["status"] == "running")
-        legacy_done = bool(legacy_status and legacy_status["status"] == "done")
-
-        section_header("Deploy legacy app", legacy_status["status"] if legacy_status else None)
-
-        if st.button("Deploy legacy app", key="run_legacy_deploy_btn", disabled=legacy_running or legacy_done):
-            job_runner.launch_step(job_id, "legacy_deploy", {"repo_path": repo_path})
-            st.rerun()
-
-        if legacy_status:
-            if legacy_status["status"] == "running":
-                st.info("Deploying legacy app... this page refreshes automatically.")
-                with st.expander("Progress log", expanded=True):
-                    st.code(job_runner.get_worker_log(job_id, "legacy_deploy") or "(no output yet)")
-                time.sleep(2)
-                st.rerun()
-            elif legacy_status["status"] == "error":
-                first_line = legacy_status["error"].strip().splitlines()[-1]
-                st.error(f"Legacy deployment failed: {first_line}")
-                with st.expander("Full details"):
-                    st.code(legacy_status["error"])
-            elif legacy_status["status"] == "done":
-                st.success(f"Legacy app live at: {legacy_status['result']['url']}")
-
+        
         st.divider()
 
         deploy_target = repo_path
