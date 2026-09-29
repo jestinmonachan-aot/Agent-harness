@@ -150,16 +150,16 @@ def deploy_legacy_app(repo_path: str, web_port: int = DEFAULT_WEB_PORT) -> dict:
     install = _run(
         ["docker", "compose", "-p", project, "exec", "-T", "app",
          "php", "bin/console", "db:install", "--no-interaction",
+         "--reconfigure", "--force",
          "--db-host=db", "--db-name=glpi", "--db-user=glpi", "--db-password=glpi"],
-        cwd=root, timeout=300,
+        cwd=root, timeout=600,
     )
-    # db:install returns non-zero if the DB is already installed from a
-    # previous run - treat that as fine, not fatal, everything else is not.
-    if install.returncode != 0 and "already" not in (install.stdout + install.stderr).lower():
+    print((install.stdout or "")[-2000:], flush=True)
+    if install.returncode != 0:
         logs = _run(["docker", "compose", "-p", project, "logs", "--tail", "100"], cwd=root).stdout
         raise RuntimeError(
-            f"db:install failed:\n{install.stderr or install.stdout}\n\n"
-            f"Container logs:\n{logs}"
+            f"db:install failed (exit {install.returncode}):\n"
+            f"{install.stderr or install.stdout}\n\nContainer logs:\n{logs}"
         )
 
     url = f"http://localhost:{web_port}"
