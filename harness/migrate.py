@@ -20,6 +20,11 @@ Two paths:
   output directory so a failed run can be resumed (pass the same
   directory back in as resume_output_dir) rather than restarted.
 
+  Planning (_plan_modules) runs under --permission-mode plan: it should
+  only read/explore and return a JSON module list, never write files.
+  Every other call (module build, assembly, direct scope) stays on the
+  default bypassPermissions mode since those steps must write output.
+
 CODEBASE MAP: when analyze has already produced a codebase_map, it is
 passed through to EVERY Claude call in both paths - the direct call,
 planning, and every individual module - so none of them re-explore the
@@ -143,6 +148,7 @@ def _plan_modules(input_repo_path: str, timeout: int, codebase_map: str = "") ->
     result = run_claude_prompt(
         prompt, cwd=str(input_repo_path), timeout=timeout,
         extra_args=["--add-dir", str(input_repo_path)],
+        permission_mode="plan",
     )
     if not result.success:
         if _looks_like_usage_limit(result.stdout, result.stderr):
@@ -269,6 +275,20 @@ def _run_full_app_module_pipeline(
             is_first_module=(i == 0), timeout=per_module_timeout,
             codebase_map=codebase_map,
         )
+
+        # Require the module's own parity-check file as proof it actually
+        # finished its self-audit, not just that the CLI call returned
+        # successfully with STACK_CHOSEN text. Every module prompt (see
+        # migration_prompts.build_module_prompt, step 7) mandates writing
+        # this file, so its absence means the run didn't really complete.
+        parity_file = output_dir / f"PARITY_CHECK_{module['id']}.md"
+        if not parity_file.exists():
+            raise RuntimeError(
+                f"Module '{module['id']}' finished without writing "
+                f"{parity_file.name} - treating it as incomplete rather than "
+                f"advancing. Output so far is preserved in {output_dir}."
+            )
+
         completed_ids.add(module["id"])
         _save_state(output_dir, {
             "scope": scope, "modules": modules,

@@ -22,7 +22,7 @@ def clone_repo(repo_url: str, dest_dir: str | None = None) -> Path:
     dest_path.mkdir(parents=True, exist_ok=True)
 
     subprocess.run(
-        ["git", "clone", "--depth", "1", repo_url, str(dest_path)],
+        ["git", "clone", "--depth", "1", "--config", "core.autocrlf=false", repo_url, str(dest_path)],
         check=True,
         capture_output=True,
         text=True,

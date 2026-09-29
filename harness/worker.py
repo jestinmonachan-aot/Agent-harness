@@ -63,6 +63,12 @@ def run_analyze(job_id: str, params: dict) -> str:
         "codebase_map": codebase_map,
     })
 
+def run_legacy_deploy(job_id: str, params: dict) -> str:
+    from harness.legacy_deploy import deploy_legacy_app
+
+    repo_path = params["repo_path"]
+    result = deploy_legacy_app(repo_path)
+    return json.dumps(result)
 
 def run_migrate(job_id: str, params: dict) -> str:
     repo_path = params["repo_path"]
@@ -118,8 +124,8 @@ STEP_FUNCS = {
     "analyze": run_analyze,
     "migrate": run_migrate,
     "deploy": run_deploy,
+    "legacy_deploy": run_legacy_deploy,
 }
-
 
 def main() -> None:
     if len(sys.argv) != 4:
@@ -142,6 +148,8 @@ def main() -> None:
     try:
         result = func(job_id, params)
         db.finish_step(job_id, step_name, "done", result=result)
+        from harness.tracker import log_finished_step
+        log_finished_step(job_id, step_name)
     except UsageLimitError as e:
         # Encode as resumable so app.py can offer "Resume migration"
         # instead of just showing a dead-end failure.

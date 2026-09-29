@@ -37,6 +37,7 @@ def run_claude_prompt(
     cwd: str | None = None,
     timeout: int = 300,
     extra_args: list[str] | None = None,
+    permission_mode: str = "bypassPermissions",
 ) -> ClaudeCLIResult:
     """
     Run a single non-interactive prompt through the Claude Code CLI.
@@ -45,6 +46,12 @@ def run_claude_prompt(
     from stdin) instead of passing it as a command-line argument, since
     long prompts can exceed Windows' command-line length limit (~8191
     chars) and get silently truncated or fail.
+
+    permission_mode: defaults to "bypassPermissions" (full read/write,
+    used by every step that needs to actually create/edit files -
+    migration, assembly, direct-scope). Pass "plan" for read-only
+    planning calls (see migrate.py's _plan_modules) where Claude should
+    explore and reason but never write anything.
     """
     claude_path = _resolve_claude_path()
     if claude_path is None:
@@ -59,7 +66,7 @@ def run_claude_prompt(
             returncode=127,
         )
 
-    args = [claude_path, "-p", "--permission-mode", "bypassPermissions"]
+    args = [claude_path, "-p", "--permission-mode", permission_mode]
     if extra_args:
         args.extend(extra_args)
 
