@@ -65,10 +65,10 @@ def run_analyze(job_id: str, params: dict) -> str:
 
 
 def run_legacy_deploy(job_id: str, params: dict) -> str:
-    from harness.legacy_deploy import deploy_legacy_app
+    from harness.legacy_deploy import deploy_legacy_app, find_free_port
 
     repo_path = params["repo_path"]
-    result = deploy_legacy_app(repo_path)
+    result = deploy_legacy_app(repo_path, web_port=find_free_port(), job_id=job_id)
     return json.dumps(result)
 
 

@@ -11,7 +11,9 @@ from datetime import datetime
 import streamlit as st
 
 from harness import db, job_runner
-from harness.legacy_deploy import stop_legacy_app
+from harness.legacy_deploy import (
+    stop_legacy_app, app_status, pause_legacy_app, start_legacy_app,
+)
 
 st.set_page_config(page_title="Legacy App Deployment", layout="wide")
 db.init_db()
@@ -67,30 +69,57 @@ else:
 
     if legacy_status and not legacy_running and repo_path:
         if st.button("Stop and reset", key="reset_legacy_btn"):
-            stop_legacy_app(repo_path)
+            stop_legacy_app(repo_path, job_id)
             db.clear_step(job_id, "legacy_deploy")
             st.rerun()
 
 st.divider()
 st.subheader("Deployed legacy apps")
 deployed = db.list_deployments("legacy")
-if deployed:
-    st.dataframe(
-        [
-            {
-                "App": d["app_name"].partition("#")[0],
-                "Version": d["app_name"].partition("#")[2] or "-",
-                "URL": d["url"],
-                "Deployed": datetime.fromtimestamp(d["created_at"]).strftime("%d/%m/%Y %H:%M"),
-            }
-            for d in deployed
-        ],
-        column_config={"URL": st.column_config.LinkColumn("URL")},
-        hide_index=True,
-        use_container_width=True,
-    )
-else:
+if not deployed:
     st.caption("No legacy apps deployed yet.")
+for d in deployed:
+    jid = d["job_id"]
+    job = db.get_job(jid)
+    rp = job["repo_path"] if job else None
+    status = app_status(rp, jid) if rp else "unknown"
+    name, _, ver = d["app_name"].partition("#")
+    when = datetime.fromtimestamp(d["created_at"]).strftime("%d/%m/%Y %H:%M")
+    cols = st.columns([2, 1, 3, 1.3, 1, 1])
+    cols[0].markdown(f"**{name}**")
+    cols[1].write(ver or "-")
+    cols[2].markdown(f"[{d['url']}]({d['url']})<br><small>{when}</small>", unsafe_allow_html=True)
+    cols[3].write({"running": "🟢 Running", "stopped": "⚪ Stopped"}.get(status, "❔ Unknown"))
+    if status == "running":
+        if cols[4].button("Stop", key=f"stop_{jid}"):
+            pause_legacy_app(rp, jid)
+            st.rerun()
+    elif status == "stopped":
+        if cols[4].button("Start", key=f"start_{jid}"):
+            err = None
+            with st.spinner("Starting..."):
+                try:
+                    start_legacy_app(rp, jid, d["url"])
+                except RuntimeError as e:
+                    err = str(e)
+            if err:
+                st.error(err)
+            else:
+                st.rerun()
+    if cols[5].button("Delete", key=f"del_{jid}"):
+        st.session_state[f"confirm_del_{jid}"] = True
+    if st.session_state.get(f"confirm_del_{jid}"):
+        st.warning(f"Delete {name} {ver}? This removes its containers and database.")
+        y, n, _sp = st.columns([1, 1, 6])
+        if y.button("Yes, delete", key=f"yes_{jid}"):
+            if rp:
+                stop_legacy_app(rp, jid)
+            db.clear_step(jid, "legacy_deploy")
+            st.session_state.pop(f"confirm_del_{jid}", None)
+            st.rerun()
+        if n.button("Cancel", key=f"no_{jid}"):
+            st.session_state.pop(f"confirm_del_{jid}", None)
+            st.rerun()
 
 # Poll last, so the deployed-apps list above still renders while a run is in progress.
 if should_poll:

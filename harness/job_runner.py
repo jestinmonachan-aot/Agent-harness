@@ -17,7 +17,7 @@ from harness import db
 # On Windows this fully detaches the child from Streamlit's process group —
 # a Streamlit crash/restart cannot take the worker down with it.
 if sys.platform == "win32":
-    _CREATIONFLAGS = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+    _CREATIONFLAGS = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
 else:
     _CREATIONFLAGS = 0
 

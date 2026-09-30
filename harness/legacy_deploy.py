@@ -131,16 +131,17 @@ def _port_in_use(port: int) -> bool:
         return s.connect_ex(("127.0.0.1", port)) == 0
 
 
-def _dc(root: Path) -> list[str]:
+def _dc(root: Path, project: str = GLPI9_PROJECT) -> list[str]:
     """Base `docker compose` command for the generated GLPI 9 stack."""
-    return ["docker", "compose", "-p", GLPI9_PROJECT,
+    return ["docker", "compose", "-p", project,
             "--project-directory", str(root),
             "-f", str(root / GLPI9_DIR / "docker-compose.yml")]
 
 
-def _deploy_glpi9(repo_path: str, web_port: int = DEFAULT_WEB_PORT) -> dict:
+def _deploy_glpi9(repo_path: str, web_port: int = DEFAULT_WEB_PORT,
+                  project: str = GLPI9_PROJECT) -> dict:
     root = Path(repo_path)
-    dc = _dc(root)
+    dc = _dc(root, project)
 
     if _port_in_use(web_port):
         raise RuntimeError(
@@ -228,12 +229,13 @@ def _deploy_glpi9(repo_path: str, web_port: int = DEFAULT_WEB_PORT) -> dict:
     return {"url": url}
 
 
-def deploy_legacy_app(repo_path: str, web_port: int = DEFAULT_WEB_PORT) -> dict:
+def deploy_legacy_app(repo_path: str, web_port: int = DEFAULT_WEB_PORT, job_id=None) -> dict:
     """Picks the right flow for the checked-out source. Returns {"url": ...}
     on success, raises RuntimeError with the relevant logs on failure."""
     root = Path(repo_path)
     if _is_glpi9(root):
-        return _deploy_glpi9(repo_path, web_port)
+        return _deploy_glpi9(repo_path, web_port,
+                             project_name(job_id) if job_id is not None else GLPI9_PROJECT)
     return _deploy_modern(repo_path, web_port)
 
 
@@ -354,12 +356,56 @@ def _deploy_modern(repo_path: str, web_port: int = DEFAULT_WEB_PORT) -> dict:
     return {"url": url}
 
 
-def stop_legacy_app(repo_path: str) -> None:
+def stop_legacy_app(repo_path: str, job_id=None) -> None:
     """Tears down the legacy containers (either flow). Safe to call even
     if nothing is running."""
     root = Path(repo_path)
     if (root / GLPI9_DIR / "docker-compose.yml").exists():
-        cmd = _dc(root) + ["down", "-v", "--remove-orphans"]
+        proj = project_name(job_id) if job_id is not None else GLPI9_PROJECT
+        cmd = _dc(root, proj) + ["down", "-v", "--remove-orphans"]
     else:
         cmd = ["docker", "compose", "-p", "legacy_glpi", "down", "-v"]
     subprocess.run(cmd, cwd=str(root), capture_output=True, text=True)
+
+
+# --------------------------------------------------------------------------
+# Per-app controls (GLPI 9 flow): status / pause (keeps data) / start
+# --------------------------------------------------------------------------
+def project_name(job_id) -> str:
+    return f"{GLPI9_PROJECT}_job{job_id}"
+
+
+def find_free_port(start: int = DEFAULT_WEB_PORT) -> int:
+    port = start
+    while _port_in_use(port):
+        port += 1
+    return port
+
+
+def app_status(repo_path: str, job_id) -> str:
+    # Returns "running", "stopped" or "unknown".
+    root = Path(repo_path)
+    if not (root / GLPI9_DIR / "docker-compose.yml").exists():
+        return "unknown"
+    r = _run(_dc(root, project_name(job_id)) + ["ps", "--status", "running", "-q"],
+             cwd=root, timeout=30)
+    if r.returncode != 0:
+        return "unknown"
+    return "running" if r.stdout.strip() else "stopped"
+
+
+def pause_legacy_app(repo_path: str, job_id) -> None:
+    root = Path(repo_path)
+    _run(_dc(root, project_name(job_id)) + ["stop"], cwd=root, timeout=120)
+
+
+def start_legacy_app(repo_path: str, job_id, url: str) -> None:
+    root = Path(repo_path)
+    port = int(url.rsplit(":", 1)[1])
+    if _port_in_use(port):
+        raise RuntimeError(f"Port {port} is in use by another app. Stop it first, then start this one.")
+    r = _run(_dc(root, project_name(job_id)) + ["start"], cwd=root, timeout=180)
+    if r.returncode != 0:
+        raise RuntimeError(f"Start failed:\n{r.stderr or r.stdout}")
+    if not _healthy(url, timeout=120):
+        raise RuntimeError(f"Containers started but {url} did not respond in time.")
