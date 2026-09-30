@@ -13,6 +13,7 @@ STEP_TO_ACTION = {
     "plan": "Migration planning",
     "migrate": "Migration",
     "deploy": "Deployment",
+    
 }
 
 def _to_dt(v):
@@ -20,7 +21,7 @@ def _to_dt(v):
         return datetime.fromtimestamp(v)
     return datetime.fromisoformat(v)
 
-def log_step(app_name, module, action, started_at, ended_at, account_type="Claude Pro"):
+def log_step(app_name, module, action, started_at, ended_at, account_type="Claude Team"):
     try:
         s = _to_dt(started_at)
         e = _to_dt(ended_at)
@@ -36,7 +37,7 @@ def log_step(app_name, module, action, started_at, ended_at, account_type="Claud
         print(f"tracker: could not log step: {ex}")
 
 
-def log_finished_step(job_id, step_name, account_type="Claude Pro"):
+def log_finished_step(job_id, step_name, account_type="Claude Team"):
     if step_name not in STEP_TO_ACTION:
         return
     try:
@@ -45,7 +46,11 @@ def log_finished_step(job_id, step_name, account_type="Claude Pro"):
         job = db.get_job(job_id)
         if not row or not job:
             return
-        app_name = job["repo_url"].rstrip("/").split("/")[-1].removesuffix(".git")
+        raw = job["repo_url"].rstrip("/")
+        base, _, ver = raw.partition("#")
+        app_name = base.split("/")[-1].removesuffix(".git")
+        if ver:
+            app_name = f"{app_name} ({ver})"
 
         params_path = Path(tempfile.gettempdir()) / "harness_step_params" / f"{job_id}_{step_name}.json"
         module = "All"
