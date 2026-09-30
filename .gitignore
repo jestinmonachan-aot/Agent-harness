@@ -17,4 +17,4 @@ reports/*.pdf
 *.log
 findings_export.json
 scripts/check_step.py
-scripts/clear_step.py
+scripts/clear_step.pypatch_dedupe.py

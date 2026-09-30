@@ -224,6 +224,10 @@ def record_deployment(job_id: int, kind: str, url: str) -> None:
     name = app_name_from_url(job["repo_url"]) if job else f"job-{job_id}"
     with _conn() as conn:
         conn.execute(
+            "DELETE FROM deployments WHERE kind = ? AND url = ? AND job_id != ?",
+            (kind, url, job_id),
+        )
+        conn.execute(
             """
             INSERT INTO deployments (job_id, kind, app_name, url, created_at)
             VALUES (?, ?, ?, ?, ?)

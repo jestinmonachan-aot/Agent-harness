@@ -78,7 +78,8 @@ if deployed:
     st.dataframe(
         [
             {
-                "App": d["app_name"],
+                "App": d["app_name"].partition("#")[0],
+                "Version": d["app_name"].partition("#")[2] or "-",
                 "URL": d["url"],
                 "Deployed": datetime.fromtimestamp(d["created_at"]).strftime("%d/%m/%Y %H:%M"),
             }

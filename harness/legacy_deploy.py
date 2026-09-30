@@ -1,12 +1,13 @@
-"""Automates bringing up the legacy application's own Docker
-environment (GLPI ships docker-compose.yaml + .docker/), instead of
-generating a custom compose file. Mirrors what `make install` does in
-GLPI's Makefile, without requiring `make` (not available on this
-Windows/Git Bash setup).
+"""Automates bringing up the legacy application's own Docker environment.
 
-Flow: docker compose up -d --build -> wait for the app container to be
-ready -> fix git ownership -> install PHP deps -> compile locales ->
-run the CLI installer -> health-check the web port -> return the URL.
+Two flows, picked automatically from the checked-out source:
+
+* Modern GLPI (10/11): the repo ships docker-compose.yaml + .docker/, so we
+  use it as-is (up -> composer -> locales -> db:install -> health check).
+* GLPI 9.x (e.g. tag 9.5.5): the repo ships NO docker setup and needs an
+  older PHP (7.2-8.0) plus npm-built front-end libs. We generate a small
+  Dockerfile + compose file under <repo>/.harness_deploy/ and run:
+  up -> composer install -> npm ci + build -> db:install -> health check.
 """
 
 from __future__ import annotations
@@ -54,7 +55,189 @@ def _healthy(url: str, timeout: int = 180) -> bool:
     return False
 
 
+
+# --------------------------------------------------------------------------
+# GLPI 9.x flow
+# --------------------------------------------------------------------------
+GLPI9_PROJECT = "legacy_glpi9"
+GLPI9_DIR = ".harness_deploy"
+
+GLPI9_DOCKERFILE = """\
+FROM php:7.4-apache
+
+# php:7.4 images are Debian bullseye (end-of-life): use the archive mirror, main only.
+RUN echo 'deb http://archive.debian.org/debian bullseye main' > /etc/apt/sources.list \\
+    && apt-get -o Acquire::Check-Valid-Until=false update \\
+    && apt-get install -y --no-install-recommends \\
+        git unzip patch libpng-dev libjpeg-dev libfreetype6-dev libicu-dev \\
+        libzip-dev libbz2-dev libxml2-dev libonig-dev libldap2-dev \\
+    && docker-php-ext-configure gd --with-freetype --with-jpeg \\
+    && docker-php-ext-install -j2 gd intl mysqli zip bz2 exif opcache ldap \\
+    && a2enmod rewrite \\
+    && echo "ServerName localhost" > /etc/apache2/conf-enabled/servername.conf \\
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=composer:2 /usr/bin/composer /usr/bin/composer
+
+RUN { echo "memory_limit=512M"; echo "max_execution_time=300"; \\
+      echo "session.cookie_httponly=On"; echo "upload_max_filesize=50M"; \\
+      echo "post_max_size=50M"; } > /usr/local/etc/php/conf.d/glpi.ini
+
+WORKDIR /var/www/html
+"""
+
+GLPI9_COMPOSE = """\
+services:
+  app:
+    build:
+      context: ./.harness_deploy
+    ports:
+      - "{port}:80"
+    volumes:
+      - .:/var/www/html
+    depends_on:
+      - db
+  db:
+    image: mariadb:10.6
+    environment:
+      MARIADB_ROOT_PASSWORD: rootpass
+      MARIADB_DATABASE: glpi
+      MARIADB_USER: glpi
+      MARIADB_PASSWORD: glpi
+    volumes:
+      - dbdata:/var/lib/mysql
+  node:
+    image: node:16-bullseye
+    working_dir: /app
+    volumes:
+      - .:/app
+    profiles: ["tools"]
+volumes:
+  dbdata:
+"""
+
+
+def _is_glpi9(root: Path) -> bool:
+    define = root / "inc" / "define.php"
+    if not define.exists() or (root / "docker-compose.yaml").exists():
+        return False
+    return "'GLPI_VERSION', '9." in define.read_text(encoding="utf-8", errors="ignore")
+
+
+def _port_in_use(port: int) -> bool:
+    import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(1)
+        return s.connect_ex(("127.0.0.1", port)) == 0
+
+
+def _dc(root: Path) -> list[str]:
+    """Base `docker compose` command for the generated GLPI 9 stack."""
+    return ["docker", "compose", "-p", GLPI9_PROJECT,
+            "--project-directory", str(root),
+            "-f", str(root / GLPI9_DIR / "docker-compose.yml")]
+
+
+def _deploy_glpi9(repo_path: str, web_port: int = DEFAULT_WEB_PORT) -> dict:
+    root = Path(repo_path)
+    dc = _dc(root)
+
+    if _port_in_use(web_port):
+        raise RuntimeError(
+            f"Port {web_port} is already in use (most likely the GLPI 11 stack). "
+            "Open the Legacy Deploy page for the old job, click 'Stop and reset', then deploy again."
+        )
+
+    out_dir = root / GLPI9_DIR
+    out_dir.mkdir(exist_ok=True)
+    (out_dir / "Dockerfile").write_text(GLPI9_DOCKERFILE, encoding="utf-8", newline="\n")
+    (out_dir / "docker-compose.yml").write_text(
+        GLPI9_COMPOSE.replace("{port}", str(web_port)), encoding="utf-8", newline="\n")
+
+    def logs() -> str:
+        return _run(dc + ["logs", "--tail", "100"], cwd=root).stdout
+
+    def app_exec(args: list[str], timeout: int = 300, env: dict | None = None):
+        cmd = dc + ["exec", "-T"]
+        for k, v in (env or {}).items():
+            cmd += ["-e", f"{k}={v}"]
+        return _run(cmd + ["app"] + args, cwd=root, timeout=timeout)
+
+    print("[legacy_deploy] GLPI 9.x detected - generating PHP 7.4 + MariaDB stack...", flush=True)
+    print("[legacy_deploy] Building and starting containers (first build takes a few minutes)...", flush=True)
+    up = _run(dc + ["up", "-d", "--build"], cwd=root, timeout=1800)
+    if up.returncode != 0:
+        raise RuntimeError(f"docker compose up failed:\n{up.stderr or up.stdout}")
+
+    print("[legacy_deploy] Waiting for app container...", flush=True)
+    for _ in range(30):
+        if app_exec(["true"], timeout=30).returncode == 0:
+            break
+        time.sleep(2)
+    else:
+        raise RuntimeError(f"App container did not become ready.\n\nContainer logs:\n{logs()}")
+
+    # Windows safety nets: CRLF in bin/ scripts, and git refusing bind-mounted repo.
+    app_exec(["sh", "-c", "sed -i 's/\\r$//' /var/www/html/bin/*"], timeout=60)
+    app_exec(["git", "config", "--global", "--add", "safe.directory", "/var/www/html"], timeout=30)
+
+    print("[legacy_deploy] Installing PHP dependencies (composer)... can take 10-30+ min on Windows bind mounts", flush=True)
+    rc = _run_streaming(
+        dc + ["exec", "-T",
+              "-e", "COMPOSER_PROCESS_TIMEOUT=1800", "-e", "COMPOSER_ALLOW_SUPERUSER=1",
+              "-e", "COMPOSER_MEMORY_LIMIT=-1",
+              "app", "composer", "install", "--no-dev", "--no-interaction", "--prefer-dist"],
+        cwd=root, timeout=2700,
+    )
+    if rc != 0 and app_exec(["test", "-f", "/var/www/html/vendor/autoload.php"], timeout=30).returncode != 0:
+        raise RuntimeError(f"composer install failed (see output above).\n\nContainer logs:\n{logs()}")
+
+    # GLPI 9.5 loads public/lib/*.css|js, which only exist after an npm build.
+    print("[legacy_deploy] Building front-end libraries (npm ci + npm run build)... can take 10+ min on Windows", flush=True)
+    rc = _run_streaming(
+        dc + ["run", "--rm", "-T", "node", "sh", "-c",
+              "(npm ci --no-audit --no-fund || npm install --no-audit --no-fund) && npm run build"],
+        cwd=root, timeout=2700,
+    )
+    if rc != 0 or not (root / "public" / "lib" / "base.js").exists():
+        raise RuntimeError("npm build failed: public/lib/base.js was not produced (see output above).")
+
+    print("[legacy_deploy] Fixing writable directories...", flush=True)
+    app_exec(["sh", "-c",
+              "mkdir -p /var/www/html/files /var/www/html/config "
+              "&& chown -R www-data:www-data /var/www/html/files /var/www/html/config || true"],
+             timeout=300)
+
+    print("[legacy_deploy] Running database install...", flush=True)
+    install = app_exec(
+        ["php", "bin/console", "db:install", "--no-interaction", "--reconfigure", "--force",
+         "--db-host=db", "--db-name=glpi", "--db-user=glpi", "--db-password=glpi"],
+        timeout=600,
+    )
+    print((install.stdout or "")[-2000:], flush=True)
+    if install.returncode != 0:
+        raise RuntimeError(
+            f"db:install failed (exit {install.returncode}):\n"
+            f"{install.stderr or install.stdout}\n\nContainer logs:\n{logs()}"
+        )
+
+    url = f"http://localhost:{web_port}"
+    print(f"[legacy_deploy] Waiting for {url} to respond...", flush=True)
+    if not _healthy(url):
+        raise RuntimeError(f"App did not become healthy at {url}.\n\nContainer logs:\n{logs()}")
+    return {"url": url}
+
+
 def deploy_legacy_app(repo_path: str, web_port: int = DEFAULT_WEB_PORT) -> dict:
+    """Picks the right flow for the checked-out source. Returns {"url": ...}
+    on success, raises RuntimeError with the relevant logs on failure."""
+    root = Path(repo_path)
+    if _is_glpi9(root):
+        return _deploy_glpi9(repo_path, web_port)
+    return _deploy_modern(repo_path, web_port)
+
+
+def _deploy_modern(repo_path: str, web_port: int = DEFAULT_WEB_PORT) -> dict:
     """Brings up GLPI's own docker-compose.yaml and installs the DB.
     Returns {"url": ...} on success, raises RuntimeError with the
     relevant logs on failure."""
@@ -172,10 +355,11 @@ def deploy_legacy_app(repo_path: str, web_port: int = DEFAULT_WEB_PORT) -> dict:
 
 
 def stop_legacy_app(repo_path: str) -> None:
-    """Tears down the legacy containers. Safe to call even if nothing
-    is running."""
+    """Tears down the legacy containers (either flow). Safe to call even
+    if nothing is running."""
     root = Path(repo_path)
-    subprocess.run(
-        ["docker", "compose", "-p", "legacy_glpi", "down", "-v"],
-        cwd=str(root), capture_output=True, text=True,
-    )
+    if (root / GLPI9_DIR / "docker-compose.yml").exists():
+        cmd = _dc(root) + ["down", "-v", "--remove-orphans"]
+    else:
+        cmd = ["docker", "compose", "-p", "legacy_glpi", "down", "-v"]
+    subprocess.run(cmd, cwd=str(root), capture_output=True, text=True)

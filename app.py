@@ -139,7 +139,7 @@ with st.sidebar:
     try:
         st.page_link("pages/1_Legacy_Deploy.py", label="Deploy the legacy app as-is")
     except Exception:
-        pass   
+        pass
 
 st.subheader("Select analysis focus areas")
 st.caption("Select the skills that you want in this application.")
@@ -164,11 +164,17 @@ with st.container(border=True, key="skills_container"):
                         selected_skills.append(skill_id)
 
 st.subheader("Repository")
-repo_col, btn_col = st.columns([4, 1])
+repo_col, branch_col, btn_col = st.columns([3, 1, 1])
 with repo_col:
     repo_url = st.text_input(
         "Repository URL",
         placeholder="https://github.com/org/app",
+        label_visibility="collapsed",
+    )
+with branch_col:
+    branch = st.text_input(
+        "Version / Branch",
+        placeholder="Version/Branch (optional), e.g. 9.5.5",
         label_visibility="collapsed",
     )
 with btn_col:
@@ -177,12 +183,18 @@ with btn_col:
 st.write("")
 
 if run_clicked:
-    job_id = job_runner.resume_or_new_job(repo_url)
+    # The branch/tag rides along after a '#', so each version of the same
+    # repo gets its own job (and clone_repo knows which ref to check out).
+    source_url = repo_url.strip()
+    if branch and branch.strip():
+        source_url = f"{source_url}#{branch.strip()}"
+
+    job_id = job_runner.resume_or_new_job(source_url)
     existing_status = job_runner.get_step_status(job_id, "analyze")
     if not existing_status or existing_status["status"] != "done":
-        job_runner.launch_step(job_id, "analyze", {"repo_url": repo_url, "skills": selected_skills})
+        job_runner.launch_step(job_id, "analyze", {"repo_url": source_url, "skills": selected_skills})
     st.session_state.job_id = job_id
-    st.session_state.repo_url = repo_url
+    st.session_state.repo_url = source_url
     st.rerun()
 
 job_id = st.session_state.job_id
@@ -378,7 +390,6 @@ if job_id is not None:
                     st.session_state.pop("resume_migration_btn", None)
                     st.rerun()
 
-        
         st.divider()
 
         deploy_target = repo_path
