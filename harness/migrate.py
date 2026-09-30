@@ -76,6 +76,11 @@ class UsageLimitError(RuntimeError):
         self.output_dir = output_dir
 
 
+class PhaseVerificationError(UsageLimitError):
+    """A phase failed verification twice. Carries output_dir so the UI can
+    offer Resume (completed phases are saved in MIGRATION_STATE.json)."""
+
+
 def create_github_repo(repo_name: str, private: bool = True) -> str:
     visibility = "--private" if private else "--public"
     proc = subprocess.run(
@@ -208,6 +213,9 @@ def _plan_modules(input_repo_path: str, timeout: int, codebase_map: str = "") ->
                 })
             if phases:
                 return phases
+    print("[migrate] WARNING: could not parse a phase plan from Claude's "
+          "output; falling back to ONE 'full_app' phase. Raw output "
+          f"(first 500 chars): {result.stdout[:500]!r}", flush=True)
     return [{"id": "full_app", "description": "Entire application", "done_criteria": []}]
 
 
@@ -326,10 +334,12 @@ def _run_phase(
 
     if problems:
         details = "\n".join(f"  - {p}" for p in problems)
-        raise RuntimeError(
+        raise PhaseVerificationError(
             f"Phase '{phase_id}' is still incomplete after a fix-up pass, so "
-            f"the migration stopped here instead of advancing. Output so far "
-            f"is preserved in {output_dir}.\nRemaining problems:\n{details}"
+            f"the migration stopped here instead of advancing. Completed "
+            f"phases are saved; resume to retry this phase.\n"
+            f"Remaining problems:\n{details}",
+            output_dir,
         )
 
     print(f"[migrate] Phase '{phase_id}' verified complete.", flush=True)
